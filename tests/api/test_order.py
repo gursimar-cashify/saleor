@@ -27,6 +27,7 @@ from saleor.order.models import Order, OrderEvent
 from saleor.payment import ChargeStatus, CustomPaymentChoices, PaymentError
 from saleor.payment.models import Payment
 from saleor.shipping.models import ShippingMethod
+from saleor.warehouse.models import Stock
 
 from .utils import assert_no_permission, get_graphql_content
 
@@ -488,7 +489,7 @@ def test_payment_information_order_events_query(
     assert data["paymentGateway"] == payment_dummy.gateway
 
 
-def test_non_staff_user_can_only_see_his_order(user_api_client, order):
+def test_non_staff_user_cannot_only_see_his_order(user_api_client, order):
     query = """
     query OrderQuery($id: ID!) {
         order(id: $id) {
@@ -499,16 +500,27 @@ def test_non_staff_user_can_only_see_his_order(user_api_client, order):
     ID = graphene.Node.to_global_id("Order", order.id)
     variables = {"id": ID}
     response = user_api_client.post_graphql(query, variables)
-    content = get_graphql_content(response)
-    order_data = content["data"]["order"]
-    assert order_data["number"] == str(order.pk)
+    assert_no_permission(response)
 
-    order.user = None
-    order.save()
-    response = user_api_client.post_graphql(query, variables)
+
+def test_query_order_as_service_account(
+    service_account_api_client, permission_manage_orders, order
+):
+    query = """
+    query OrderQuery($id: ID!) {
+        order(id: $id) {
+            token
+        }
+    }
+    """
+    ID = graphene.Node.to_global_id("Order", order.id)
+    variables = {"id": ID}
+    response = service_account_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_orders]
+    )
     content = get_graphql_content(response)
     order_data = content["data"]["order"]
-    assert not order_data
+    assert order_data["token"] == order.token
 
 
 def test_draft_order_create(
@@ -784,8 +796,10 @@ def test_draft_order_complete(
     line_1, line_2 = order.lines.order_by("-quantity").all()
     line_1.quantity = 1
     line_1.save(update_fields=["quantity"])
-    assert line_1.variant.quantity_available >= line_1.quantity
-    assert line_2.variant.quantity_available < line_2.quantity
+    stock_1 = Stock.objects.get(product_variant=line_1.variant)
+    stock_2 = Stock.objects.get(product_variant=line_2.variant)
+    assert stock_1.quantity_available >= line_1.quantity
+    assert stock_2.quantity_available < line_2.quantity
 
     order_id = graphene.Node.to_global_id("Order", order.id)
     variables = {"id": order_id}
@@ -1548,6 +1562,32 @@ def test_order_mark_as_paid(
     assert event_order_paid.user == staff_user
 
 
+def test_order_mark_as_paid_no_billing_address(
+    staff_api_client, permission_manage_orders, order_with_lines, staff_user
+):
+    order = order_with_lines
+    order_with_lines.billing_address = None
+    order_with_lines.save()
+
+    query = """
+            mutation markPaid($id: ID!) {
+                orderMarkAsPaid(id: $id) {
+                    orderErrors {
+                        code
+                    }
+                }
+            }
+        """
+    order_id = graphene.Node.to_global_id("Order", order.id)
+    variables = {"id": order_id}
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_orders]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["orderMarkAsPaid"]["orderErrors"]
+    assert data[0]["code"] == OrderErrorCode.BILLING_ADDRESS_NOT_SET.name
+
+
 ORDER_VOID = """
     mutation voidOrder($id: ID!) {
         orderVoid(id: $id) {
@@ -1933,6 +1973,90 @@ def test_order_by_token_query(api_client, order):
     assert content["data"]["orderByToken"]["id"] == order_id
 
 
+def test_order_by_token_user_restriction(api_client, order):
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            user {
+                id
+            }
+        }
+    }
+    """
+    response = api_client.post_graphql(query, {"token": order.token})
+    assert_no_permission(response)
+
+
+def test_order_by_token_events_restriction(api_client, order):
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            events {
+                id
+            }
+        }
+    }
+    """
+    response = api_client.post_graphql(query, {"token": order.token})
+    assert_no_permission(response)
+
+
+def test_authorized_access_to_order_by_token(
+    user_api_client, staff_api_client, customer_user, order, permission_manage_users
+):
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            user {
+                id
+            }
+        }
+    }
+    """
+    variables = {"token": order.token}
+    customer_user_id = graphene.Node.to_global_id("User", customer_user.id)
+
+    response = user_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["orderByToken"]["user"]["id"] == customer_user_id
+
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_users]
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["orderByToken"]["user"]["id"] == customer_user_id
+
+
+def test_query_draft_order_by_token_with_requester_as_customer(
+    user_api_client, draft_order
+):
+    draft_order.user = user_api_client.user
+    draft_order.save(update_fields=["user"])
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            id
+        }
+    }
+    """
+    response = user_api_client.post_graphql(query, {"token": draft_order.token})
+    content = get_graphql_content(response)
+    assert not content["data"]["orderByToken"]
+
+
+def test_query_draft_order_by_token_as_anonymous_customer(api_client, draft_order):
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            id
+        }
+    }
+    """
+    response = api_client.post_graphql(query, {"token": draft_order.token})
+    content = get_graphql_content(response)
+    assert not content["data"]["orderByToken"]
+
+
 MUTATION_CANCEL_ORDERS = """
     mutation CancelManyOrders($ids: [ID]!, $restock: Boolean!) {
         orderBulkCancel(ids: $ids, restock: $restock) {
@@ -1947,7 +2071,7 @@ MUTATION_CANCEL_ORDERS = """
 
 
 def test_order_bulk_cancel_with_restock(
-    staff_api_client, orders, order_with_lines, permission_manage_orders
+    staff_api_client, orders, order_with_lines, permission_manage_orders, address
 ):
     assert order_with_lines.can_cancel()
     orders.append(order_with_lines)

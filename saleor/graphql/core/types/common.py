@@ -9,11 +9,14 @@ from ..enums import (
     GiftCardErrorCode,
     MenuErrorCode,
     OrderErrorCode,
+    PageErrorCode,
     PaymentErrorCode,
     PermissionEnum,
     ProductErrorCode,
     ShippingErrorCode,
     ShopErrorCode,
+    StockErrorCode,
+    WarehouseErrorCode,
     WebhookErrorCode,
     WishlistErrorCode,
 )
@@ -74,6 +77,10 @@ class ShippingError(Error):
     code = ShippingErrorCode(description="The error code.")
 
 
+class PageError(Error):
+    code = PageErrorCode(description="The error code.")
+
+
 class PaymentError(Error):
     code = PaymentErrorCode(description="The error code.")
 
@@ -84,6 +91,14 @@ class GiftCardError(Error):
 
 class ExtensionsError(Error):
     code = ExtensionsErrorCode(description="The error code.")
+
+
+class StockError(Error):
+    code = StockErrorCode(description="The error code.")
+
+
+class WarehouseError(Error):
+    code = WarehouseErrorCode(description="The error code.")
 
 
 class WebhookError(Error):

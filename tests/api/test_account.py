@@ -9,6 +9,7 @@ from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.core.validators import URLValidator
+from django.test import override_settings
 from freezegun import freeze_time
 from prices import Money
 
@@ -305,12 +306,13 @@ def test_user_query_permission_manage_users_get_customer(
 
 
 def test_user_query_as_service_account(
-    service_account_api_client, customer_user, permission_manage_users, service_account
+    service_account_api_client, customer_user, permission_manage_users
 ):
-    service_account.permissions.add(permission_manage_users)
     customer_id = graphene.Node.to_global_id("User", customer_user.pk)
     variables = {"id": customer_id}
-    response = service_account_api_client.post_graphql(USER_QUERY, variables)
+    response = service_account_api_client.post_graphql(
+        USER_QUERY, variables, permissions=[permission_manage_users]
+    )
     content = get_graphql_content(response)
     data = content["data"]["user"]
     assert customer_user.email == data["email"]
@@ -464,7 +466,8 @@ def test_me_query(user_api_client):
 
 def test_me_query_anonymous_client(api_client):
     response = api_client.post_graphql(ME_QUERY)
-    assert_no_permission(response)
+    content = get_graphql_content(response)
+    assert content["data"]["me"] is None
 
 
 def test_me_query_customer_can_not_see_note(
@@ -576,8 +579,18 @@ def test_user_with_cancelled_fulfillments(
 
 
 ACCOUNT_REGISTER_MUTATION = """
-    mutation RegisterAccount($password: String!, $email: String!) {
-        accountRegister(input: {password: $password, email: $email}) {
+    mutation RegisterAccount(
+        $password: String!,
+        $email: String!,
+        $redirectUrl: String
+    ) {
+        accountRegister(
+            input: {
+                password: $password,
+                email: $email,
+                redirectUrl: $redirectUrl
+            }
+        ) {
             errors {
                 field
                 message
@@ -590,18 +603,27 @@ ACCOUNT_REGISTER_MUTATION = """
 """
 
 
-def test_customer_register(user_api_client):
+@override_settings(
+    ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL=True, ALLOWED_CLIENT_HOSTS=["localhost"]
+)
+@patch("saleor.account.emails._send_account_confirmation_email")
+def test_customer_register(send_account_confirmation_email_mock, api_client):
     email = "customer@example.com"
-    variables = {"email": email, "password": "Password"}
+    variables = {
+        "email": email,
+        "password": "Password",
+        "redirectUrl": "http://localhost:3000",
+    }
     query = ACCOUNT_REGISTER_MUTATION
     mutation_name = "accountRegister"
-    response = user_api_client.post_graphql(query, variables)
+    response = api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"][mutation_name]
     assert not data["errors"]
+    assert send_account_confirmation_email_mock.delay.call_count == 1
     new_user = User.objects.get(email=email)
 
-    response = user_api_client.post_graphql(query, variables)
+    response = api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"][mutation_name]
     assert data["errors"]
@@ -611,6 +633,30 @@ def test_customer_register(user_api_client):
     customer_creation_event = account_events.CustomerEvent.objects.get()
     assert customer_creation_event.type == account_events.CustomerEvents.ACCOUNT_CREATED
     assert customer_creation_event.user == new_user
+
+
+@override_settings(ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL=False)
+@patch("saleor.account.emails._send_account_confirmation_email")
+def test_customer_register_disabled_email_confirmation(
+    send_account_confirmation_email_mock, api_client
+):
+    variables = {"email": "customer@example.com", "password": "Password"}
+    response = api_client.post_graphql(ACCOUNT_REGISTER_MUTATION, variables)
+    errors = response.json()["data"]["accountRegister"]["errors"]
+    assert errors == []
+    assert send_account_confirmation_email_mock.delay.call_count == 0
+
+
+@override_settings(ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL=True)
+@patch("saleor.account.emails._send_account_confirmation_email")
+def test_customer_register_no_redirect_url(
+    send_account_confirmation_email_mock, api_client
+):
+    variables = {"email": "customer@example.com", "password": "Password"}
+    response = api_client.post_graphql(ACCOUNT_REGISTER_MUTATION, variables)
+    errors = response.json()["data"]["accountRegister"]["errors"]
+    assert "redirectUrl" in map(lambda error: error["field"], errors)
+    assert send_account_confirmation_email_mock.delay.call_count == 0
 
 
 CUSTOMER_CREATE_MUTATION = """
@@ -2109,6 +2155,18 @@ REQUEST_PASSWORD_RESET_MUTATION = """
 """
 
 
+CONFIRM_ACCOUNT_MUTATION = """
+    mutation ConfirmAccount($email: String!, $token: String!) {
+        confirmAccount(email: $email, token: $token) {
+            errors {
+                field
+                message
+            }
+        }
+    }
+"""
+
+
 @patch("saleor.account.emails._send_password_reset_email")
 def test_account_reset_password(
     send_password_reset_email_mock, user_api_client, customer_user
@@ -2125,6 +2183,41 @@ def test_account_reset_password(
     url = send_password_reset_email_mock.mock_calls[0][1][1]
     url_validator = URLValidator()
     url_validator(url)
+
+
+def test_account_confirmation(user_api_client, customer_user):
+    customer_user.is_active = False
+    customer_user.save()
+
+    variables = {
+        "email": customer_user.email,
+        "token": default_token_generator.make_token(customer_user),
+    }
+    user_api_client.post_graphql(CONFIRM_ACCOUNT_MUTATION, variables)
+
+    customer_user.refresh_from_db()
+    assert customer_user.is_active is True
+
+
+def test_account_confirmation_invalid_user(user_api_client, customer_user):
+    variables = {
+        "email": "non-existing@example.com",
+        "token": default_token_generator.make_token(customer_user),
+    }
+    response = user_api_client.post_graphql(CONFIRM_ACCOUNT_MUTATION, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["confirmAccount"]["errors"] == [
+        {"field": "email", "message": "User with this email doesn't exist"}
+    ]
+
+
+def test_account_confirmation_invalid_token(user_api_client, customer_user):
+    variables = {"email": customer_user.email, "token": "invalid_token"}
+    response = user_api_client.post_graphql(CONFIRM_ACCOUNT_MUTATION, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["confirmAccount"]["errors"] == [
+        {"field": "token", "message": "Invalid or expired token."}
+    ]
 
 
 @patch("saleor.account.emails._send_password_reset_email")
@@ -3051,14 +3144,12 @@ def test_address_query_as_not_owner(
 
 
 def test_address_query_as_service_account_with_permission(
-    service_account_api_client,
-    service_account,
-    address_other_country,
-    permission_manage_users,
+    service_account_api_client, address_other_country, permission_manage_users,
 ):
-    service_account.permissions.add(permission_manage_users)
     variables = {"id": graphene.Node.to_global_id("Address", address_other_country.pk)}
-    response = service_account_api_client.post_graphql(ADDRESS_QUERY, variables)
+    response = service_account_api_client.post_graphql(
+        ADDRESS_QUERY, variables, permissions=[permission_manage_users]
+    )
     content = get_graphql_content(response)
     data = content["data"]["address"]
     assert data["country"]["code"] == address_other_country.country.code

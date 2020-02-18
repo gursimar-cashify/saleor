@@ -3,7 +3,11 @@ import logging
 import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import opentracing as ot
+import opentracing.tags as ot_tags
 from django.conf import settings
+from django.db import connection
+from django.db.backends.postgresql.base import DatabaseWrapper
 from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
 from django.shortcuts import render_to_response
 from django.urls import reverse
@@ -24,6 +28,17 @@ API_PATH = SimpleLazyObject(lambda: reverse("api"))
 
 unhandled_errors_logger = logging.getLogger("saleor.graphql.errors.unhandled")
 handled_errors_logger = logging.getLogger("saleor.graphql.errors.handled")
+
+
+def tracing_wrapper(execute, sql, params, many, context):
+    conn: DatabaseWrapper = context["connection"]
+    operation = f"{conn.alias} {conn.display_name}"
+    with ot.global_tracer().start_active_span(operation_name=operation) as scope:
+        span = scope.span
+        span.set_tag(ot_tags.COMPONENT, "db")
+        span.set_tag(ot_tags.DATABASE_STATEMENT, sql)
+        span.set_tag(ot_tags.DATABASE_TYPE, conn.display_name)
+        return execute(sql, params, many, context)
 
 
 class GraphQLView(View):
@@ -63,7 +78,7 @@ class GraphQLView(View):
     def dispatch(self, request, *args, **kwargs):
         # Handle options method the GraphQlView restricts it.
         if request.method == "GET":
-            if settings.DEBUG:
+            if settings.PLAYGROUND_ENABLED:
                 return render_to_response("graphql/playground.html")
             return HttpResponseNotAllowed(["OPTIONS", "POST"])
 
@@ -103,22 +118,32 @@ class GraphQLView(View):
     def get_response(
         self, request: HttpRequest, data: dict
     ) -> Tuple[Optional[Dict[str, List[Any]]], int]:
-        execution_result = self.execute_graphql_request(request, data)
-        status_code = 200
-        if execution_result:
-            response = {}
-            if execution_result.errors:
-                response["errors"] = [
-                    self.format_error(e) for e in execution_result.errors
-                ]
-            if execution_result.invalid:
-                status_code = 400
+        with ot.global_tracer().start_active_span(operation_name="request") as scope:
+            span = scope.span
+            span.set_tag(ot_tags.COMPONENT, "http")
+            span.set_tag(ot_tags.HTTP_METHOD, request.method)
+            span.set_tag(
+                ot_tags.HTTP_URL, request.build_absolute_uri(request.get_full_path())
+            )
+
+            execution_result = self.execute_graphql_request(request, data)
+            status_code = 200
+            if execution_result:
+                response = {}
+                if execution_result.errors:
+                    response["errors"] = [
+                        self.format_error(e) for e in execution_result.errors
+                    ]
+                if execution_result.invalid:
+                    status_code = 400
+                else:
+                    response["data"] = execution_result.data
+                result: Optional[Dict[str, List[Any]]] = response
             else:
-                response["data"] = execution_result.data
-            result: Optional[Dict[str, List[Any]]] = response
-        else:
-            result = None
-        return result, status_code
+                result = None
+
+            span.set_tag(ot_tags.HTTP_STATUS_CODE, status_code)
+            return result, status_code
 
     def get_root_value(self):
         return self.root_value
@@ -164,14 +189,15 @@ class GraphQLView(View):
             # executor is not a valid argument in all backends
             extra_options["executor"] = self.executor
         try:
-            return document.execute(  # type: ignore
-                root=self.get_root_value(),
-                variables=variables,
-                operation_name=operation_name,
-                context=request,
-                middleware=self.middleware,
-                **extra_options,
-            )
+            with connection.execute_wrapper(tracing_wrapper):
+                return document.execute(  # type: ignore
+                    root=self.get_root_value(),
+                    variables=variables,
+                    operation_name=operation_name,
+                    context=request,
+                    middleware=self.middleware,
+                    **extra_options,
+                )
         except Exception as e:
             return ExecutionResult(errors=[e], invalid=True)
 
